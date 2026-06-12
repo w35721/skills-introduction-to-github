@@ -31,71 +31,116 @@ prerequisite Logic Apps adds is an Azure subscription.
 
 ---
 
-## Option A: No-premium design (ConnectWise workflow rule → email → Teams)
+## Option A: No-premium design (correlate ConnectWise notification emails)
 
-The trick is to split responsibilities: **ConnectWise detects the
-unresponded ticket** (its workflow rules already know how to do this), and
-**Power Automate only converts an email into a Teams DM** — which needs
-nothing but standard connectors.
+ConnectWise already sends a notification email for every ticket event —
+including **assignment** and **engineer response**. So Power Automate never
+needs to ask ConnectWise anything: it just watches a mailbox, correlates
+the two email types by ticket number, and reminds the owner every
+15 minutes until the "engineer responded" email for that ticket arrives.
+Standard connectors only (Office 365 Outlook, SharePoint, Teams).
 
-```
-ConnectWise workflow rule
-  (status in "New"/"Needs Response", age ≥ 15 min)
-  └─ sends templated email to a shared mailbox
-        └─ Power Automate: "When a new email arrives (V3)"  [standard]
-             └─ parse ticket #, summary, owner email from the email
-             └─ Teams: Post card in chat with the owner      [standard]
-```
+### State table
 
-### 1. ConnectWise workflow rule
+Create a SharePoint list `TicketReminders` with columns:
 
-Setup Tables → **Workflow Rules** → new rule on your service board:
+| Column | Type | Notes |
+|---|---|---|
+| Title | text | Ticket number |
+| OwnerEmail | text | Engineer to remind |
+| TicketSummary | text | For the card |
+| AssignedAt | date/time | When the assignment email arrived |
+| Responded | yes/no | Default No |
+| RemindersSent | number | Default 0, for escalation |
 
-- **Conditions:** `Closed = No`, `Status` in your "awaiting response"
-  statuses (e.g. New, New (email), Needs Response), owner not empty.
-- **Events:** add one event per reminder interval — e.g. at 15, 30, 45 and
-  60 minutes after the condition is met. Each event fires **once per
-  ticket**, which is why this design gives a fixed escalation ladder rather
-  than an infinite loop. (At the final event, consider notifying the
-  service manager instead of the owner.)
-- **Action:** Send email to your dedicated mailbox (e.g.
-  `cw-reminders@yourdomain.com`) using an email template. Put structured,
-  parseable content in it, for example:
+### Prerequisite: identifiable emails
 
-  ```
-  Subject: CW-REMINDER|[Ticket Number]|[Owner Email]
-  Body:
-  Summary: [Summary]
-  Company: [Company Name]
-  Entered: [Date Entered]
-  ```
+Each flow needs to tell the email types apart and extract the ticket
+number, so check the ConnectWise email setup (Setup Tables → Email
+Templates / the templates on each workflow notification):
 
-  (Use your CW version's template tokens; the exact token names vary.
-  If a token for the owner's email isn't available, send the owner's
-  identifier and map it to an email in the flow — see "Owner → Teams
-  mapping" below.)
+- The **assignment** and **engineer response** notifications must have
+  distinguishable subjects (e.g. containing "has been assigned" vs.
+  "has been updated by"). If they're ambiguous — and especially if a
+  *customer* reply produces a similar email to an *engineer* reply — edit
+  the templates to add a marker token to the subject. Template edits are
+  the only ConnectWise-side change this design needs.
+- The ticket number must appear in a fixed position, e.g. `Ticket#12345`.
+- Ideally the assignment template includes the owner's email address in
+  the body; if it only has a name/identifier, add a mapping step (see
+  "Owner → Teams mapping").
 
-- When the engineer responds, board/workflow automation moves the ticket
-  out of the qualifying status, the remaining events never fire, and the
-  reminders stop — same self-terminating behavior as the API design.
+Route these notifications (or a copy, via a transport rule) to a dedicated
+shared mailbox such as `cw-notifications@yourdomain.com`.
 
-### 2. Power Automate flow (all standard connectors)
+### Flow 1 — register the assignment
 
-1. **Trigger:** Office 365 Outlook — *When a new email arrives (V3)* on the
-   shared mailbox, with Subject Filter `CW-REMINDER`.
-2. **Parse the subject:**
-   - Ticket #: `split(triggerOutputs()?['body/subject'], '|')[1]`
-   - Owner email: `split(triggerOutputs()?['body/subject'], '|')[2]`
-   - Pull summary/company out of the body the same way with `split()` on
-     the line prefixes, or just include the email body text in the card.
-3. **Teams — Post card in a chat or channel:** Post as Flow bot, in chat
-   with the parsed owner email, using the same adaptive card shown in the
-   API design below.
-4. **(Optional)** Mark the email read / move it to an archive folder.
+1. **Trigger:** *When a new email arrives in a shared mailbox (V3)*,
+   subject filter = your assignment marker.
+2. **Parse ticket number** from the subject, e.g. for `...Ticket#12345...`:
 
-This costs nothing beyond licenses you already have, and the flow itself is
-trivial — all the scheduling and "has anyone responded?" logic stays inside
-ConnectWise where it's native.
+   ```
+   first(split(last(split(triggerOutputs()?['body/subject'], 'Ticket#')), ' '))
+   ```
+
+3. **SharePoint — Get items** with filter `Title eq '<ticket#>'`.
+4. **Condition:** if a row exists (re-assignment), update it — new
+   OwnerEmail, `Responded = No`, `RemindersSent = 0`, refresh AssignedAt.
+   Otherwise **Create item** with `AssignedAt = utcNow()`.
+
+### Flow 2 — register the engineer's response
+
+1. **Trigger:** same mailbox, subject filter = your engineer-response
+   marker. (Make sure customer replies do *not* match this filter.)
+2. Parse the ticket number the same way.
+3. **Get items** by ticket number → **Update item:** `Responded = Yes`.
+   If no row exists yet (response email beat the assignment email, or the
+   engineer answered before the first run), **Create item** with
+   `Responded = Yes` so Flow 1's upsert doesn't resurrect it incorrectly —
+   have Flow 1 skip rows already marked responded for the same assignment.
+
+### Flow 3 — the 15-minute reminder loop
+
+1. **Trigger:** Recurrence, every 15 minutes.
+2. **SharePoint — Get items**, OData filter:
+
+   ```
+   Responded eq 0 and AssignedAt lt datetime'@{addMinutes(utcNow(), -15)}'
+   ```
+
+3. **Apply to each** row:
+   - **Teams — Post card in a chat or channel** (Flow bot → chat with
+     `OwnerEmail`), using the adaptive card from the API design below.
+   - **Update item:** increment `RemindersSent`.
+   - **(Optional escalation)** Condition: if `RemindersSent >= 4`
+     (an hour of silence), also post to the service manager or a team
+     channel.
+
+Because Flow 3 re-reads the list every run, reminders genuinely repeat
+every 15 minutes until Flow 2 flips `Responded` — the true infinite loop,
+with no premium connectors. Add a weekly cleanup flow (or extend Flow 2)
+to delete responded rows and keep the list small.
+
+### Lighter variant: single long-running flow (no SharePoint)
+
+If you'd rather avoid the list: in Flow 1, after parsing, add a
+**Do until** loop — *Delay 15 minutes* → *Get emails (V3)* searching the
+mailbox for the response marker + ticket number received after the trigger
+time → if found, exit; if not, post the Teams card. Raise the Do until
+limits (default is 60 iterations / 1 hour timeout). This works, but one
+flow run stays open per ticket for the whole wait, a failed run silently
+stops reminding, and there's no audit trail — the state-table design is
+more robust for real ticket volume.
+
+### Variant without notification emails: workflow rules
+
+If you'd rather not rely on the notification stream, ConnectWise
+**workflow rules** can do the detection instead: a rule on the board with
+conditions (status in "New"/"Needs Response", owner set) and events at 15,
+30, 45, 60 minutes, each emailing a structured message
+(`CW-REMINDER|<ticket#>|<owner email>`) that a single standard flow turns
+into the Teams card. Each event fires once per ticket, so this gives a
+fixed escalation ladder rather than an infinite loop.
 
 ---
 
