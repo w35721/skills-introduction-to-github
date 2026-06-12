@@ -9,6 +9,98 @@ storage is required.
 
 ---
 
+## Choosing an approach (licensing)
+
+Calling the ConnectWise REST API from Power Automate requires the **HTTP
+action, which is a premium connector** (and the "When an HTTP request is
+received" trigger is premium too, so ConnectWise can't call the flow
+directly either). Pick based on what you have:
+
+| | Approach | Cost | Looping behavior |
+|---|---|---|---|
+| **A** | ConnectWise workflow rule → email → standard Power Automate flow | $0 (standard connectors only) | Escalating reminders at fixed intervals (15/30/45/60 min), not infinite |
+| **B** | Azure Logic Apps (Consumption) with the HTTP design below | ~$1–2/month pay-per-run | True every-15-min loop until response |
+| **C** | Power Automate Premium with the HTTP design below | Premium per-user license | True every-15-min loop until response |
+
+Options B and C use the identical design described in
+[the API-polling design](#option-bc-api-polling-design-logic-apps-or-power-automate-premium) —
+in Logic Apps the HTTP action is **built-in** (no premium licensing), and the
+Microsoft Teams connector is available there as well. A 15-minute recurrence
+is ~3,000 runs/month, which costs pennies on the Consumption plan. The only
+prerequisite Logic Apps adds is an Azure subscription.
+
+---
+
+## Option A: No-premium design (ConnectWise workflow rule → email → Teams)
+
+The trick is to split responsibilities: **ConnectWise detects the
+unresponded ticket** (its workflow rules already know how to do this), and
+**Power Automate only converts an email into a Teams DM** — which needs
+nothing but standard connectors.
+
+```
+ConnectWise workflow rule
+  (status in "New"/"Needs Response", age ≥ 15 min)
+  └─ sends templated email to a shared mailbox
+        └─ Power Automate: "When a new email arrives (V3)"  [standard]
+             └─ parse ticket #, summary, owner email from the email
+             └─ Teams: Post card in chat with the owner      [standard]
+```
+
+### 1. ConnectWise workflow rule
+
+Setup Tables → **Workflow Rules** → new rule on your service board:
+
+- **Conditions:** `Closed = No`, `Status` in your "awaiting response"
+  statuses (e.g. New, New (email), Needs Response), owner not empty.
+- **Events:** add one event per reminder interval — e.g. at 15, 30, 45 and
+  60 minutes after the condition is met. Each event fires **once per
+  ticket**, which is why this design gives a fixed escalation ladder rather
+  than an infinite loop. (At the final event, consider notifying the
+  service manager instead of the owner.)
+- **Action:** Send email to your dedicated mailbox (e.g.
+  `cw-reminders@yourdomain.com`) using an email template. Put structured,
+  parseable content in it, for example:
+
+  ```
+  Subject: CW-REMINDER|[Ticket Number]|[Owner Email]
+  Body:
+  Summary: [Summary]
+  Company: [Company Name]
+  Entered: [Date Entered]
+  ```
+
+  (Use your CW version's template tokens; the exact token names vary.
+  If a token for the owner's email isn't available, send the owner's
+  identifier and map it to an email in the flow — see "Owner → Teams
+  mapping" below.)
+
+- When the engineer responds, board/workflow automation moves the ticket
+  out of the qualifying status, the remaining events never fire, and the
+  reminders stop — same self-terminating behavior as the API design.
+
+### 2. Power Automate flow (all standard connectors)
+
+1. **Trigger:** Office 365 Outlook — *When a new email arrives (V3)* on the
+   shared mailbox, with Subject Filter `CW-REMINDER`.
+2. **Parse the subject:**
+   - Ticket #: `split(triggerOutputs()?['body/subject'], '|')[1]`
+   - Owner email: `split(triggerOutputs()?['body/subject'], '|')[2]`
+   - Pull summary/company out of the body the same way with `split()` on
+     the line prefixes, or just include the email body text in the card.
+3. **Teams — Post card in a chat or channel:** Post as Flow bot, in chat
+   with the parsed owner email, using the same adaptive card shown in the
+   API design below.
+4. **(Optional)** Mark the email read / move it to an archive folder.
+
+This costs nothing beyond licenses you already have, and the flow itself is
+trivial — all the scheduling and "has anyone responded?" logic stays inside
+ConnectWise where it's native.
+
+---
+
+## Option B/C: API-polling design (Logic Apps or Power Automate Premium)
+
 ## Prerequisites
 
 1. **ConnectWise Manage API credentials**
@@ -17,8 +109,10 @@ storage is required.
    - A **public/private key pair** generated for that API member.
    - A **clientId** registered at https://developer.connectwise.com (required
      header on every API call).
-2. **Power Automate Premium license** — the HTTP action used to call the
-   ConnectWise REST API is a premium connector.
+2. **Either** an Azure subscription (Logic Apps Consumption — the HTTP
+   action there is built-in, no premium licensing) **or** a Power Automate
+   Premium license (the HTTP action in Power Automate is a premium
+   connector).
 3. **Microsoft Teams connector** (standard) — engineers must be reachable by
    their ConnectWise `officeEmail`, which should match their Microsoft 365 UPN.
    If the addresses differ, add a mapping table (see "Owner → Teams mapping").
